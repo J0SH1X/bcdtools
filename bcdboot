@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""bcdboot for Linux - create/repair boot files + BCD on an EFI system partition.
+
+  bcdboot <windows-dir> [/s <esp-mount>] [/f uefi] [/l <locale>] [/d] [/v] [/c]
+          [--efi-base <dir>] [--esp-device <dev|gpt:DISK:PART|mbr:SIG:OFF>]
+          [--win-device <dev|spec>] [--no-fallback] [--name "<desc>"]
+
+  <windows-dir>  the mounted Windows partition root (containing Windows/) or the Windows dir itself.
+  /s <esp>       mounted EFI system partition (FAT32). Required (no drive letters on Linux).
+  --efi-base     directory shaped like the media's `efi/` folder (efi/boot, efi/microsoft/boot);
+                 used for any boot file missing from <windows-dir>/Windows/Boot/EFI.
+  --esp-device / --win-device   override device detection (needed for image files/non-mounted tests).
+"""
+import os, shutil, struct, sys, argparse
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from bcdlib import *
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+TEMPLATE = os.path.join(HERE, "templates", "BCD-Template")
+
+def ci(base, *parts):
+    """case-insensitive path resolve; returns real path or None"""
+    p = base
+    for part in parts:
+        if not os.path.isdir(p): return None
+        hit = next((e for e in os.listdir(p) if e.lower() == part.lower()), None)
+        if hit is None: return None
+        p = os.path.join(p, hit)
+    return p
+
+def pe_machine(path):
+    try:
+        with open(path, "rb") as f:
+            d = f.read(4096)
+        o = struct.unpack_from("<I", d, 0x3c)[0]
+        return struct.unpack_from("<H", d, o + 4)[0]
+    except Exception: return None
+
+FALLBACK = {0x1c0: "bootarm.efi", 0x1c2: "bootarm.efi", 0x1c4: "bootarm.efi", 0xaa64: "bootaa64.efi",
+            0x8664: "bootx64.efi", 0x14c: "bootia32.efi"}
+
+def copy_tree_over(src, dst, log):
+    for r, ds, fs in os.walk(src):
+        rel = os.path.relpath(r, src)
+        out = os.path.join(dst, rel) if rel != "." else dst
+        os.makedirs(out, exist_ok=True)
+        for f in fs:
+            shutil.copyfile(os.path.join(r, f), os.path.join(out, f)); log("  copy %s" % os.path.join(rel, f))
+
+def read_product(winroot):
+    p = ci(winroot, "Windows", "System32", "config", "SOFTWARE")
+    if not p: return None
+    try:
+        with Hive(p) as h:
+            n = h.path("Microsoft\\Windows NT\\CurrentVersion")
+            v = h.values(n).get("ProductName") if n else None
+            return from_u16z(v[1]) if v else None
+    except Exception: return None
+
+def build_store(path, locale, esp_dev, win_dev, desc, log):
+    """Fresh BCD from the template (Windows RT media template) + resume + loader."""
+    shutil.copyfile(TEMPLATE, path)
+    with Store(path, True) as s:
+        bm = BOOTMGR_GUID
+        # trim the media template down to what bcdboot itself creates
+        for g in ("{7254a080-1510-4e85-ac0f-e7fb3d444736}", "{a1943bbc-ea85-487c-97c7-c9ede908a38a}",
+                  "{b012b84d-c47c-4ed5-b722-c0c42163e569}", "{cbd971bf-b7b8-4885-951a-fa03044f5d71}",
+                  "{466f5a88-0af2-4f76-9038-095b170dc21c}"):
+            if s.node(g): s.delete_object(g)
+        for g in (bm, MEMDIAG_GUID):
+            for e in (0x45000001, 0x47000005): s.delete_element(g, e)
+        s.delete_element(bm, 0x23000003)
+        if not s.node("{1afa9c49-16ab-4a5c-901b-212802da9460}"):
+            s.create_object("{1afa9c49-16ab-4a5c-901b-212802da9460}", 0x20200004)
+            s.set_raw("{1afa9c49-16ab-4a5c-901b-212802da9460}", 0x14000006, REG_MULTI_SZ, multi(["{7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}"]))
+        if not s.node("{5189b25c-5558-4bf2-bca4-289b11bd29e2}"):
+            s.create_object("{5189b25c-5558-4bf2-bca4-289b11bd29e2}", 0x20100000)
+        s.set_raw(MEMDIAG_GUID, LIB["description"], REG_SZ, u16z("Windows Memory Diagnostic"))
+        res, ldr = new_guid(), new_guid()
+        s.set_raw(bm, LIB["device"], REG_BINARY, esp_dev)
+        s.set_raw(bm, LIB["path"], REG_SZ, u16z("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"))
+        s.set_raw(bm, LIB["locale"], REG_SZ, u16z(locale))
+        s.set_raw(bm, 0x25000004, REG_BINARY, struct.pack("<Q", 30))
+        s.set_raw(MEMDIAG_GUID, LIB["device"], REG_BINARY, esp_dev)
+        s.set_raw(MEMDIAG_GUID, LIB["path"], REG_SZ, u16z("\\EFI\\Microsoft\\Boot\\memtest.efi"))
+        s.set_raw(MEMDIAG_GUID, LIB["locale"], REG_SZ, u16z(locale))
+        add_os_entries(s, res, ldr, win_dev, desc, locale)
+        s.set_raw(bm, BOOTMGR["default"], REG_SZ, u16z(ldr))
+        s.set_raw(bm, BOOTMGR["resumeobject"], REG_SZ, u16z(res))
+        s.set_objlist(bm, BOOTMGR["displayorder"], [ldr])
+        s.set_description_value("KeyName", REG_SZ, u16z("BCD00000000"))
+        s.set_description_value("System", REG_DWORD, struct.pack("<I", 1))
+        s.commit()
+    log("  new BCD: loader %s resume %s" % (ldr, res))
+
+def add_os_entries(s, res, ldr, win_dev, desc, locale):
+    s.create_object(res, TYPES["resume"])
+    for eid, t, d in [
+        (0x11000001, REG_BINARY, win_dev), (0x12000002, REG_SZ, u16z("\\Windows\\system32\\winresume.efi")),
+        (0x12000004, REG_SZ, u16z("Windows Resume Application")), (0x12000005, REG_SZ, u16z(locale)),
+        (0x14000006, REG_MULTI_SZ, multi(["{1afa9c49-16ab-4a5c-901b-212802da9460}"])),
+        (0x16000060, REG_BINARY, b"\x01"), (0x17000077, REG_BINARY, bytes.fromhex("7500001500000000")),
+        (0x21000001, REG_BINARY, win_dev), (0x22000002, REG_SZ, u16z("\\hiberfil.sys")),
+        (0x25000008, REG_BINARY, struct.pack("<Q", 1))]:
+        s.set_raw(res, eid, t, d)
+    s.create_object(ldr, TYPES["osloader"])
+    for eid, t, d in [
+        (0x11000001, REG_BINARY, win_dev), (0x12000002, REG_SZ, u16z("\\Windows\\system32\\winload.efi")),
+        (0x12000004, REG_SZ, u16z(desc)), (0x12000005, REG_SZ, u16z(locale)),
+        (0x14000006, REG_MULTI_SZ, multi(["{6efb52bf-1766-41db-a6b3-0ee5eff72bd7}"])),
+        (0x16000060, REG_BINARY, b"\x01"), (0x17000077, REG_BINARY, bytes.fromhex("7500001500000000")),
+        (0x21000001, REG_BINARY, win_dev), (0x22000002, REG_SZ, u16z("\\Windows")),
+        (0x23000003, REG_SZ, u16z(res)), (0x25000020, REG_BINARY, struct.pack("<Q", 0)),
+        (0x250000c2, REG_BINARY, struct.pack("<Q", 1))]:
+        s.set_raw(ldr, eid, t, d)
+
+def update_store(path, locale, esp_dev, win_dev, desc, log, make_default=True):
+    with Store(path, True) as s:
+        bm = BOOTMGR_GUID
+        # existing loader pointing at this Windows? refresh it in place.
+        found = None
+        for g in s.guids():
+            if s.type_of(g) != TYPES["osloader"]: continue
+            els = s.elements(g)
+            p = els.get(0x12000002); sr = els.get(0x22000002); od = els.get(0x21000001)
+            if (p and from_u16z(p[1]).lower() == "\\windows\\system32\\winload.efi" and
+                    sr and from_u16z(sr[1]).lower() == "\\windows" and od and od[1] == win_dev):
+                found = g; break
+        if found:
+            ldr = found
+            r = s.get(ldr, 0x23000003); res = from_u16z(r[1]) if r else None
+            log("  existing entry %s refreshed" % ldr)
+            s.set_raw(ldr, 0x12000005, REG_SZ, u16z(locale))
+            if res and s.node(res): s.set_raw(res, 0x11000001, REG_BINARY, win_dev); s.set_raw(res, 0x21000001, REG_BINARY, win_dev)
+        else:
+            res, ldr = new_guid(), new_guid()
+            add_os_entries(s, res, ldr, win_dev, desc, locale)
+            order = s.objlist(bm, BOOTMGR["displayorder"])
+            s.set_objlist(bm, BOOTMGR["displayorder"], [ldr] + [x for x in order if x != ldr])
+            log("  new entry %s (resume %s)" % (ldr, res))
+        s.set_raw(bm, LIB["device"], REG_BINARY, esp_dev)
+        s.set_raw(bm, LIB["path"], REG_SZ, u16z("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"))
+        s.set_raw(bm, LIB["locale"], REG_SZ, u16z(locale))
+        if make_default:
+            s.set_raw(bm, BOOTMGR["default"], REG_SZ, u16z(ldr))
+            s.set_raw(bm, BOOTMGR["resumeobject"], REG_SZ, u16z(res)) if res else None
+        if s.node(MEMDIAG_GUID):
+            s.set_raw(MEMDIAG_GUID, LIB["device"], REG_BINARY, esp_dev)
+            s.set_raw(MEMDIAG_GUID, LIB["path"], REG_SZ, u16z("\\EFI\\Microsoft\\Boot\\memtest.efi"))
+        s.commit()
+
+def main():
+    ap = argparse.ArgumentParser(prog="bcdboot", add_help=False)
+    ap.add_argument("windir", nargs="?")
+    ap.add_argument("-s", dest="esp")
+    ap.add_argument("-f", dest="fw", default="uefi")
+    ap.add_argument("-l", dest="locale", default="en-US")
+    ap.add_argument("-d", dest="nodefault", action="store_true")
+    ap.add_argument("-v", dest="verbose", action="store_true")
+    ap.add_argument("-c", dest="clean", action="store_true")
+    ap.add_argument("--efi-base"); ap.add_argument("--esp-device"); ap.add_argument("--win-device")
+    ap.add_argument("--no-fallback", action="store_true"); ap.add_argument("--name")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("-h", "--help", dest="help", action="store_true")
+    argv = [("-" + x[1:]) if x.lower() in ("/s","/f","/l","/d","/v","/c") else ("-h" if x == "/?" else x) for x in sys.argv[1:]]
+    a = ap.parse_args(argv)
+    if a.help or not a.windir or not a.esp:
+        print(__doc__); return 0 if a.help else 1
+    log = (lambda m: print(m)) if a.verbose else (lambda m: None)
+    if a.fw.lower() != "uefi": sys.exit("only /f uefi is supported (target is a UEFI ARM tablet)")
+
+    win = os.path.abspath(a.windir)
+    if os.path.basename(win).lower() == "windows" and ci(win, "System32"): win = os.path.dirname(win)
+    if not ci(win, "Windows", "System32"): sys.exit("error: %s has no Windows\\System32" % a.windir)
+    esp = os.path.abspath(a.esp)
+    if not os.path.isdir(esp): sys.exit("error: ESP %s not found/mounted" % esp)
+
+    esp_dev = parse_device_spec(a.esp_device) if a.esp_device else device_for_path(esp)
+    win_dev = parse_device_spec(a.win_device) if a.win_device else device_for_path(win)
+    print("ESP device    :", describe_device(esp_dev)); print("Windows device:", describe_device(win_dev))
+    if a.dry_run: return 0
+
+    # ---- boot files
+    src_efi = ci(win, "Windows", "Boot", "EFI")
+    boot = os.path.join(esp, "EFI", "Microsoft", "Boot"); os.makedirs(boot, exist_ok=True)
+    print("Copying boot files to", boot)
+    if src_efi: copy_tree_over(src_efi, boot, log)
+    else: print("  (no Windows\\Boot\\EFI in the Windows partition)")
+    for sub in ("Fonts", "Resources"):
+        s = ci(win, "Windows", "Boot", sub)
+        if s: copy_tree_over(s, os.path.join(boot, sub), log)
+    if a.efi_base:                                   # fill gaps from media `efi/` folder
+        mb = ci(a.efi_base, "microsoft", "boot") or ci(a.efi_base, "efi", "microsoft", "boot")
+        if mb:
+            for r, ds, fs in os.walk(mb):
+                rel = os.path.relpath(r, mb)
+                if rel == "." and False: pass
+                for f in fs:
+                    if f.lower() in ("bcd", "efisys.bin", "efisys_noprompt.bin", "cdboot.efi", "cdboot_noprompt.efi"): continue
+                    d = os.path.join(boot, rel, f) if rel != "." else os.path.join(boot, f)
+                    if not os.path.exists(d):
+                        os.makedirs(os.path.dirname(d), exist_ok=True); shutil.copyfile(os.path.join(r, f), d); log("  base " + f)
+    # bootmgfw.efi: must exist. Media only has bootarm.efi (same boot manager).
+    mgfw = os.path.join(boot, "bootmgfw.efi")
+    if not os.path.exists(mgfw):
+        cand = ci(a.efi_base, "boot", "bootarm.efi") or ci(a.efi_base, "efi", "boot", "bootarm.efi") if a.efi_base else None
+        if cand: shutil.copyfile(cand, mgfw); log("  bootmgfw.efi <- media bootarm.efi")
+        else: sys.exit("error: no bootmgfw.efi found (use --efi-base <dir of media efi folder>)")
+    # fallback path \EFI\Boot\boot<arch>.efi (ARM firmware often only looks here)
+    m = pe_machine(mgfw); fb = FALLBACK.get(m)
+    print("boot manager machine: 0x%x" % (m or 0))
+    if fb and not a.no_fallback:
+        os.makedirs(os.path.join(esp, "EFI", "Boot"), exist_ok=True)
+        shutil.copyfile(mgfw, os.path.join(esp, "EFI", "Boot", fb)); print("  EFI/Boot/%s written" % fb)
+    mt = os.path.join(boot, "memtest.efi")
+    # ---- BCD
+    prod = a.name or read_product(win) or "Windows"
+    bcd = os.path.join(boot, "BCD")
+    if os.path.exists(bcd) and not a.clean:
+        print("Updating existing BCD (", prod, ")"); update_store(bcd, a.locale, esp_dev, win_dev, prod, log, not a.nodefault)
+    else:
+        print("Creating new BCD (", prod, ")"); build_store(bcd, a.locale, esp_dev, win_dev, prod, log)
+    print("Boot files successfully created.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

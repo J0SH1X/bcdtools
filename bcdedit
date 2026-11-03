@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""bcdedit for Linux - edit Windows BCD stores. Usage: bcdedit /? """
+import os, shutil, struct, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from bcdlib import *
+
+HELP = """BCDEDIT - Boot Configuration Data store editor (Linux port)
+
+  bcdedit [/store <file>] [/v] <command> ...
+
+  /enum [all|active|firmware|bootmgr|osloader|resume|{id}]   list entries (default: active)
+  /create [{id}] /d <desc> /application <bootmgr|osloader|resume|memdiag>
+  /create [{id}] /d <desc> /inherit <osloader|resume>
+  /copy {id} /d <desc>                    clone an entry
+  /delete {id} [/cleanup]                 delete an entry (and drop it from displayorder)
+  /set [{id}] <element> <value>           ({id} defaults to {default}); element = name or 8-hex id
+  /deletevalue [{id}] <element>
+  /displayorder {id}... [/addfirst|/addlast|/remove]
+  /default {id}      /timeout <sec>      /bootsequence {id}...
+  /toolsdisplayorder {id}... [/addfirst|/addlast|/remove]
+  /export <file>     /import <file>
+  /dumpdevice [{id}] <element>            hex-dump a device element
+
+Without /store, set the store with --store or env BCDSTORE.
+IDs: GUIDs or {bootmgr} {default} {current} {memdiag} {globalsettings} {dbgsettings} {emssettings} ...
+"""
+
+def die(m): print(m, file=sys.stderr); sys.exit(1)
+
+def label_of(s, g):
+    k = REVERSE_KNOWN.get(g)
+    try:
+        d = s.get(BOOTMGR_GUID, BOOTMGR["default"])
+        if d and from_u16z(d[1]).lower() == g: return "{default}"
+    except Exception: pass
+    return k or g
+
+def fmt_value(s, kind, eid, typ, data, verbose):
+    f = fmt_of(eid)
+    if f in ("string",): return from_u16z(data)
+    if f == "object":
+        g = from_u16z(data).lower(); return label_of(s, g) if not verbose else g
+    if f == "objectlist":
+        return ["" + (label_of(s, x.lower()) if not verbose else x) for x in from_multi(data)]
+    if f == "integer":
+        n = struct.unpack("<Q", data.ljust(8, b"\0")[:8])[0]
+        return "0x%x" % n if eid in (0x15000011,) or n > 9999 else str(n)
+    if f == "boolean": return "Yes" if data[:1] != b"\0" else "No"
+    if f == "intlist":
+        return [hex(struct.unpack("<Q", data[i:i+8].ljust(8, b"\0"))[0]) for i in range(0, len(data), 8)]
+    if f == "device": return describe_device(data)
+    return data.hex()
+
+def show(s, g, verbose):
+    t = s.type_of(g); kind = kind_of_type(t)
+    title = {"bootmgr": "Windows Boot Manager", "osloader": "Windows Boot Loader",
+             "resume": "Windows Resume Application", "memdiag": "Windows Memory Tester"}.get(kind)
+    els = s.elements(g)
+    if not title:
+        title = {0x20100000: "Inheritable Settings", 0x20200003: "Inheritable Settings",
+                 0x30000000: "Device options"}.get(t, "Entry (type %08x)" % t)
+    print(title); print("-" * len(title))
+    print("%-23s %s" % ("identifier", g if verbose else label_of(s, g)))
+    for eid in sorted(els):
+        typ, data = els[eid]
+        v = fmt_value(s, kind, eid, typ, data, verbose)
+        nm = element_name(eid, kind) if not verbose or True else "%08x" % eid
+        if verbose: nm = "%08x" % eid if nm == "%08x" % eid else nm
+        if isinstance(v, list):
+            print("%-23s %s" % (nm, v[0] if v else ""))
+            for x in v[1:]: print("%-23s %s" % ("", x))
+        else: print("%-23s %s" % (nm, v))
+    print()
+
+def pop_opt(a, names, has_arg=False):
+    for n in names:
+        for i, x in enumerate(a):
+            if x.lower() == n:
+                if has_arg:
+                    if i + 1 >= len(a): die("%s needs a value" % n)
+                    v = a[i+1]; del a[i:i+2]; return v
+                del a[i]; return True
+    return None
+
+def main(argv):
+    a = argv[1:]
+    store = pop_opt(a, ["/store", "-store", "--store"], True) or os.environ.get("BCDSTORE")
+    verbose = bool(pop_opt(a, ["/v", "-v"]))
+    if not a or a[0] in ("/?", "-h", "--help", "/help"): print(HELP); return 0
+    cmd = a.pop(0).lower().lstrip("/-")
+    if not store: die("no store: use /store <file> (or env BCDSTORE)")
+    if cmd in ("import",):
+        shutil.copyfile(a[0], store); return 0
+    if cmd == "export":
+        shutil.copyfile(store, a[0]); return 0
+    write = cmd not in ("enum", "dumpdevice")
+    if not os.path.exists(store): die("store not found: " + store)
+    s = Store(store, write)
+    try:
+        r = run(s, cmd, a, verbose)
+        if write and r is not False: s.commit()
+    finally:
+        s.close()
+    return 0
+
+def pos_id_and_rest(s, a):
+    if a and a[0].startswith("{"): return s.resolve(a[0]), a[1:]
+    return s.resolve("{default}"), a
+
+def run(s, cmd, a, verbose):
+    if cmd == "enum":
+        what = (a[0].lower() if a else "active")
+        if what.startswith("{"):
+            g = s.resolve(what); show(s, g, verbose); return
+        wanted = {"all": None, "active": ("bootmgr", "osloader", "resume", "memdiag"),
+                  "bootmgr": ("bootmgr",), "osloader": ("osloader",), "resume": ("resume",),
+                  "firmware": ()}.get(what)
+        if what not in ("all", "active", "bootmgr", "osloader", "resume", "firmware"): die("bad enum type " + what)
+        order = [BOOTMGR_GUID] + [g for g in s.objlist(BOOTMGR_GUID, BOOTMGR["displayorder"])]
+        rest = [g for g in s.guids() if g not in order]
+        for g in order + rest:
+            if not s.node(g): continue
+            if wanted is not None and kind_of_type(s.type_of(g)) not in wanted: continue
+            if what == "active" and g != BOOTMGR_GUID and g not in order and kind_of_type(s.type_of(g)) != "memdiag": continue
+            show(s, g, verbose)
+        return False
+    if cmd == "create":
+        gid = None
+        if a and a[0].startswith("{"): gid = resolve_guid(a.pop(0))
+        desc = pop_opt(a, ["/d"], True) or ""
+        app = pop_opt(a, ["/application"], True)
+        inh = pop_opt(a, ["/inherit"], True)
+        if bool(app) == bool(inh): die("specify exactly one of /application or /inherit")
+        if app:
+            if app.lower() not in TYPES: die("unknown application type " + app)
+            t = TYPES[app.lower()]
+        else:
+            t = {"osloader": 0x20200003, "resume": 0x20200004}.get(inh.lower())
+            if not t: die("unknown inherit type " + inh)
+        gid = gid or new_guid()
+        s.create_object(gid, t)
+        if desc: s.set_raw(gid, LIB["description"], REG_SZ, u16z(desc))
+        print("The entry %s was successfully created." % gid); return
+    if cmd == "copy":
+        src = s.resolve(a.pop(0)); desc = pop_opt(a, ["/d"], True)
+        gid = new_guid(); s.create_object(gid, s.type_of(src))
+        for eid, (typ, d) in s.elements(src).items(): s.set_raw(gid, eid, typ, d)
+        if desc: s.set_raw(gid, LIB["description"], REG_SZ, u16z(desc))
+        print("The entry was successfully copied to %s." % gid); return
+    if cmd == "delete":
+        g = s.resolve(a[0]); pop_opt(a, ["/cleanup", "/nocleanup"])
+        for lg, eid in ((BOOTMGR_GUID, BOOTMGR["displayorder"]), (BOOTMGR_GUID, BOOTMGR["toolsdisplayorder"]),
+                        (BOOTMGR_GUID, BOOTMGR["bootsequence"])):
+            l = s.objlist(lg, eid)
+            if g in l: s.set_objlist(lg, eid, [x for x in l if x != g])
+        d = s.get(BOOTMGR_GUID, BOOTMGR["default"])
+        if d and from_u16z(d[1]).lower() == g: s.delete_element(BOOTMGR_GUID, BOOTMGR["default"])
+        s.delete_object(g); print("The operation completed successfully."); return
+    if cmd == "set":
+        g, rest = pos_id_and_rest(s, a)
+        if len(rest) < 2: die("usage: /set [{id}] <element> <value>")
+        kind = kind_of_type(s.type_of(g)); eid = element_id(rest[0], kind)
+        typ, data = encode_element(eid, " ".join(rest[1:]) if fmt_of(eid) in ("string", "objectlist", "intlist") else rest[1])
+        s.set_raw(g, eid, typ, data); print("The operation completed successfully."); return
+    if cmd == "deletevalue":
+        g, rest = pos_id_and_rest(s, a)
+        eid = element_id(rest[0], kind_of_type(s.type_of(g)))
+        if not s.delete_element(g, eid): die("element not found")
+        print("The operation completed successfully."); return
+    if cmd in ("displayorder", "toolsdisplayorder", "bootsequence"):
+        eid = BOOTMGR[cmd]
+        addfirst = pop_opt(a, ["/addfirst"]); addlast = pop_opt(a, ["/addlast"]); rem = pop_opt(a, ["/remove"])
+        ids = [s.resolve(x) for x in a]; cur = s.objlist(BOOTMGR_GUID, eid)
+        if rem: new = [x for x in cur if x not in ids]
+        elif addfirst: new = ids + [x for x in cur if x not in ids]
+        elif addlast: new = [x for x in cur if x not in ids] + ids
+        else: new = ids
+        s.set_objlist(BOOTMGR_GUID, eid, new); print("The operation completed successfully."); return
+    if cmd == "default":
+        s.set_raw(BOOTMGR_GUID, BOOTMGR["default"], REG_SZ, u16z(s.resolve(a[0]))); print("The operation completed successfully."); return
+    if cmd == "timeout":
+        s.set_raw(BOOTMGR_GUID, BOOTMGR["timeout"], REG_BINARY, struct.pack("<Q", int(a[0]))); print("The operation completed successfully."); return
+    if cmd == "dumpdevice":
+        g, rest = pos_id_and_rest(s, a)
+        v = s.get(g, element_id(rest[0], kind_of_type(s.type_of(g)))); print(v[1].hex() if v else "not found"); return False
+    die("unknown command: " + cmd)
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv))
+    except (KeyError, ValueError, OSError) as e: die("error: %s" % e)
